@@ -1,0 +1,620 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\geometry{margin=2.2cm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=teal
+}
+\setlist[itemize]{leftmargin=2em}
+\setlist[enumerate]{leftmargin=2em}
+\renewcommand{\arraystretch}{1.18}
+
+\newcommand{\Normal}{\mathcal{N}}
+\newcommand{\std}{\operatorname{std}}
+
+\title{大语言模型初始化策略综述}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文总结公开论文、官方代码和模型配置中可查的大语言模型初始化策略。这里的“初始化”包括两层含义：一是从头预训练时如何随机初始化参数，二是在指令微调、强化学习对齐、长上下文扩展、词表扩展等阶段如何从已有 checkpoint 继承或扩展参数。由于 GPT-4、Claude、Gemini 等闭源模型没有公开完整训练细节，本文不会臆测其具体初始化，只在最后列出“未披露”。总体趋势是：早期 BERT/GPT 系列大量使用小方差高斯或截断高斯（典型标准差 $0.02$）；深层 decoder-only 模型进一步引入残差分支深度缩放；T5/PaLM 等模型使用更细粒度的 fan-in 或按矩阵角色区分的初始化；近年的 LLaMA、Mistral、Qwen、Gemma、OLMo 等公开模型大多回到工程上稳定、简单的 $0.02$ 标准差初始化，并把训练稳定性交给 Pre-LN/RMSNorm、RoPE、无 bias、warmup、梯度裁剪和优化器设计共同完成。
+\end{abstract}
+
+\section{问题定义与总览}
+
+Transformer 大模型的参数初始化要解决三个目标：
+
+\begin{enumerate}
+  \item \textbf{打破对称性}：线性层权重不能全零，否则同层神经元梯度相同。
+  \item \textbf{控制前向激活尺度}：若 $y=xW$，并假设 $x_i$ 与 $W_{ij}$ 独立，则
+  \[
+    \mathrm{Var}(y_j) \approx n_{\mathrm{in}}\mathrm{Var}(x_i)\mathrm{Var}(W_{ij}).
+  \]
+  因此 fan-in 初始化常令 $\std(W)=1/\sqrt{n_{\mathrm{in}}}$，使线性层输出方差不随宽度爆炸。
+  \item \textbf{控制残差流随深度累积}：若每个残差分支初始输出方差为常数，$L$ 个 block 累加后残差流尺度约随 $\sqrt{L}$ 增长。因此 GPT-2、GPT-3、Megatron/GPT-NeoX 一类模型会缩小残差分支输出投影。
+\end{enumerate}
+
+现代 LLM 的初始化不能孤立理解。Pre-LN/RMSNorm 让每个子层输入先被归一化，因此能显著降低深层训练难度；RoPE/ALiBi 等位置方法减少或取消可学习位置表；无 bias 设计减少额外尺度漂移；warmup、梯度裁剪、AdamW/Adafactor 的参数尺度处理也会改变“合适初始化”的区间。
+
+\section{主要策略分类}
+
+\subsection{小方差高斯或截断高斯}
+
+最常见策略是令绝大多数权重矩阵服从
+\[
+  W_{ij}\sim \Normal(0,\sigma^2),\qquad \sigma\in\{0.02, 0.01, 0.006\}.
+\]
+BERT、GPT-2、OPT、BLOOM、LLaMA、Mistral、Qwen、Gemma、OLMo 等都可以归入这一大类。它的优点是简单、实现一致、调参经验丰富。缺点是它没有显式随宽度或深度变化，因此当模型更深、残差分支更多、归一化顺序变化时，可能需要额外的残差缩放、warmup 或更保守学习率。
+
+\subsection{残差分支深度缩放}
+
+GPT-2 论文明确提出“modified initialization”：为了补偿残差路径随深度的累积，将残差层权重在初始化时乘以 $1/\sqrt{N}$，其中 $N$ 是残差层数量 \cite{gpt2paper}。工程实现中常把一个 Transformer block 的 attention output projection 和 MLP output projection 看作两个残差分支，因此写成
+\[
+  \sigma_{\mathrm{residual\ output}}=\frac{0.02}{\sqrt{2L}},
+\]
+其中 $L$ 是 block 数。这一思想后来被 GPT-3 继承 \cite{gpt3paper}，也影响了 Megatron-LM、GPT-NeoX 等训练框架。
+
+\subsection{按矩阵角色区分的结构化初始化}
+
+T5 和 GPT-NeoX 不是只给所有矩阵一个全局标准差，而是根据矩阵在注意力、MLP、embedding、输出投影中的角色设置不同尺度。例如 T5 的 query projection 使用 $\std=(d_{\mathrm{model}}d_{\mathrm{kv}})^{-1/2}$，key/value 使用 $d_{\mathrm{model}}^{-1/2}$，输出投影使用 $(h d_{\mathrm{kv}})^{-1/2}$。Hugging Face 的 T5 实现注释称这是 Mesh TensorFlow 的注意力初始化，用来避免 softmax 前额外缩放 \cite{t5hfcode}。
+
+\subsection{fan-in 与参数尺度初始化}
+
+PaLM 对 kernel weights 使用 fan-in variance scaling：
+\[
+  W\sim \Normal\left(0,\frac{1}{\sqrt{n_{\mathrm{in}}}}\right),
+\]
+embedding 使用 $\Normal(0,1)$；由于输入输出 embedding 共享，pre-softmax logits 再乘以 $1/\sqrt{n}$ \cite{palmpaper}。PaLM 论文进一步解释，Adafactor 的 parameter scaling 会按参数矩阵 RMS 调整学习率；这与 GPT-3 手动缩放 Adam 学习率有相似效果，但能让 embedding 和 LayerNorm scale 等不同尺度参数不被同样缩小。
+
+\subsection{checkpoint 继承初始化}
+
+指令微调、RLHF、DPO/RLAIF、长上下文继续训练等阶段通常不再从随机参数开始，而是从 base/pretrained checkpoint 初始化。此时最重要的是：
+
+\begin{itemize}
+  \item 新增参数（新 token、adapter、LoRA、classification head、reward head）如何初始化；
+  \item 是否冻结原模型；
+  \item 新旧词表、RoPE 频率、位置范围变化是否会造成尺度不匹配。
+\end{itemize}
+
+InstructGPT/ChatGPT 路线就是典型 checkpoint 继承：SFT 从 GPT-3 checkpoint 开始，reward model 和 PPO policy 也从已有语言模型或 SFT 模型初始化，而不是重新随机训练一个大模型 \cite{instructgpt}。LLaMA-2-Chat、Mistral-Instruct、Qwen-Instruct、DeepSeek-R1 等也都属于这一类。
+
+\section{代表性模型逐项说明}
+
+\subsection{原始 Transformer}
+
+原始 Transformer 是后续 LLM 初始化的基准。它使用残差连接、LayerNorm、scaled dot-product attention 中的 $1/\sqrt{d_k}$，并在工程实现中采用 Xavier/Glorot 一类方差保持初始化 \cite{transformer}。这一时期的核心思想是让每层前向和反向信号尺度大致稳定。由于原始机器翻译模型深度较浅，论文没有像 GPT-2 那样专门处理百层级残差路径累积。
+
+\textbf{分析}：原始 Transformer 的 $1/\sqrt{d_k}$ 是 attention logits 的尺度控制，不等同于权重初始化；但它与初始化共同决定 softmax 是否过早饱和。后续 T5 的 query 初始化实际上是在权重尺度上吸收了部分 attention scaling 思想。
+
+\subsection{BERT、RoBERTa、ALBERT、ELECTRA}
+
+BERT 官方代码中的 `initializer\_range` 默认值为 $0.02$，说明为“用于初始化所有 weight matrices 的 truncated normal initializer 的标准差”；dense kernel、word embedding、position embedding、token type embedding 均使用该初始化，bias 为零，LayerNorm 的 scale 为一、offset 为零 \cite{bertcode}。RoBERTa、ALBERT、ELECTRA 等 encoder-only 模型基本沿用这一 BERT 风格初始化。
+
+\textbf{论文中的解释}：BERT 论文并没有把 $0.02$ 初始化作为主要贡献来做消融解释。它更像是经验稳定的工程选择。
+
+\textbf{分析}：BERT-base/large 深度分别为 12/24 层，且是 Post-LN 风格 Transformer encoder。$0.02$ 比很多 fan-in 初始化在大宽度下更小，有助于降低训练初期 attention/MLP 输出尺度，但它不是严格宽度自适应的。对于更深模型，单纯 BERT 初始化通常不够，需要 Pre-LN、残差缩放或更保守优化设置。
+
+\subsection{GPT-2}
+
+GPT-2 代码中 token embedding 使用 $\Normal(0,0.02^2)$，position embedding 使用 $\Normal(0,0.01^2)$，dense/conv1d 权重默认使用 $\Normal(0,0.02^2)$，bias 为零，LayerNorm scale 为一、bias 为零 \cite{gpt2code}。论文额外说明使用 modified initialization：残差层权重按 $1/\sqrt{N}$ 缩放，以补偿残差路径随深度累积 \cite{gpt2paper}。
+
+\textbf{论文中的解释}：GPT-2 明确说该初始化是为了 account for accumulation on the residual path with model depth。也就是说，随着 block 增多，残差分支输出不断相加，如果不缩小输出投影，残差流方差会增长。
+
+\textbf{分析}：GPT-2 的初始化把两个经验结合起来：大部分矩阵保持 $0.02$ 小方差，直接进入残差流的输出投影再随深度缩小。这比“所有层统一 $0.02$”更适合深层 decoder-only 模型，也比全局缩小所有矩阵更不容易削弱注意力和 MLP 内部的表达能力。
+
+\subsection{GPT-3}
+
+GPT-3 论文说明其模型与 GPT-2 使用相同架构，包括 modified initialization、pre-normalization 和可逆 tokenizer；主要差异是部分层使用 alternating dense and locally banded sparse attention \cite{gpt3paper}。因此 GPT-3 的初始化可视为 GPT-2 残差缩放策略在更大规模上的继承。
+
+\textbf{论文中的解释}：GPT-3 没有重新展开初始化消融，而是把 GPT-2 的 modified initialization 作为可扩展架构的一部分。
+
+\textbf{分析}：175B 规模下，初始化本身不是唯一稳定性来源。GPT-3 同时依赖学习率随模型规模调整、warmup、Adam 超参数和大 batch 训练。残差缩放的意义在于降低深度方向的方差累积，让优化器面对的初始 loss landscape 更温和。
+
+\subsection{T5、mT5、FLAN-T5}
+
+T5 使用 encoder-decoder 架构、Pre-LN/RMSNorm 风格的 LayerNorm（不减均值、无 bias）以及相对位置 bias。Hugging Face T5 初始化复现了 Mesh TensorFlow 方案 \cite{t5paper,t5hfcode}：
+
+\begin{itemize}
+  \item shared embedding：$\Normal(0,1)$；
+  \item T5LayerNorm scale：初始化为 $1$；
+  \item MLP 输入投影 $W_i$：$\std=d_{\mathrm{model}}^{-1/2}$；
+  \item MLP 输出投影 $W_o$：$\std=d_{\mathrm{ff}}^{-1/2}$；
+  \item gated MLP 的两个输入投影同样使用 $d_{\mathrm{model}}^{-1/2}$；
+  \item attention query：$\std=(d_{\mathrm{model}}d_{\mathrm{kv}})^{-1/2}$；
+  \item attention key/value：$\std=d_{\mathrm{model}}^{-1/2}$；
+  \item attention output：$\std=(h d_{\mathrm{kv}})^{-1/2}$；
+  \item relative attention bias：$\std=d_{\mathrm{model}}^{-1/2}$。
+\end{itemize}
+
+若输入输出 embedding 绑定，T5 在输出 logits 前还会对 hidden states 乘以 $d_{\mathrm{model}}^{-1/2}$。
+
+\textbf{论文/代码中的解释}：T5 代码明确注释 attention 初始化用于避免 softmax 前额外缩放 \cite{t5hfcode}。T5 论文的主要贡献是 text-to-text 统一框架和 span corruption，不把初始化作为核心贡献。
+
+\textbf{分析}：T5 的初始化比 GPT/BERT 风格更“矩阵角色敏感”。它允许 embedding 具有较大尺度，但通过归一化和 logits 缩放控制输出；attention 的 query/key/value 分别缩放，使 logits 和 value aggregation 更接近可控范围。这种方案适合 encoder-decoder 和相对位置 bias，但实现复杂度高于统一 $0.02$。
+
+\subsection{GPT-J、GPT-NeoX 与 Pythia}
+
+GPT-J 和 GPT-NeoX 继承了 GPT-3/GPT-like decoder-only 方向，同时采用 RoPE 和并行 attention+FFN 结构。GPT-NeoX-20B 论文单列初始化小节：FFN 输出层进入残差前使用 Mesh Transformer JAX 引入的初始化
+\[
+  \std=\frac{2}{L\sqrt{d}},
+\]
+以防止激活随深度和宽度增长；系数 $2$ 用来补偿 attention 与 FFN 并行组织。其他层使用 Nguyen 和 Salazar 的 small init：
+\[
+  \std=\sqrt{\frac{2}{d+4d}}=\sqrt{\frac{2}{5d}}.
+\]
+\cite{gptneoxpaper}
+
+\textbf{论文中的解释}：GPT-NeoX 明确解释该方案防止 activations 随 depth 和 width 增长，且并行层结构需要额外系数补偿。
+
+\textbf{分析}：GPT-NeoX 的策略比 GPT-2 更激进：不仅缩小残差输出，还让非输出层采用宽度相关 small init。它适合 20B 级开放训练，但也意味着学习率、warmup 和优化器设置需要与初始化共同调参；过小初始化可能让早期表示更新较慢。
+
+Pythia 模型族同样基于 GPT-NeoX 训练栈，并公开了从 step 0（初始化）到后续大量训练步数的 checkpoint \cite{pythiarepo,pythiapaper}。它并没有提出一套新的随机初始化公式，而是把 GPT-NeoX 风格的训练 recipe 透明化，方便研究者观察初始化之后的学习动态。
+
+\textbf{分析}：Pythia 的价值在于透明性。研究初始化时，最终 checkpoint 只能告诉我们“训练后长成什么样”，而 Pythia 的中间 checkpoint 能让人检查早期参数范数、激活尺度和 loss spike 是否与初始化有关。
+
+\subsection{OPT}
+
+OPT 是 Meta 公开的 GPT-3 风格 decoder-only 模型族。Hugging Face OPT 配置中 `init\_std` 默认值为 $0.02$，说明为初始化所有权重矩阵的 truncated normal initializer 标准差 \cite{optdocs,optpaper}。OPT 使用 Pre-LN，embedding 与 LM head 权重绑定。
+
+\textbf{论文中的解释}：OPT 论文重点在开放复现、训练日志和模型发布，没有把初始化作为核心创新。
+
+\textbf{分析}：OPT 选择了最保守、最容易复现的 GPT/BERT 风格初始化。对于希望复现 GPT-3 训练行为的研究者，这降低了实现差异；代价是缺少 PaLM/T5/GPT-NeoX 那种针对矩阵角色或残差深度的显式尺度控制。
+
+\subsection{BLOOM}
+
+BLOOM 是 BigScience 训练的开放 multilingual decoder-only 模型。BLOOM 配置中的 `initializer\_range` 默认值为 $0.02$，用于所有权重矩阵的 truncated normal initializer \cite{bloomdocs,bloompaper}。BLOOM 使用 Pre-LN、GELU、ALiBi 位置偏置，因此没有大型可学习 absolute position embedding 表。
+
+\textbf{论文中的解释}：BLOOM 论文主要讨论多语言数据、训练基础设施、ALiBi 和开放协作；初始化不是主要贡献。
+
+\textbf{分析}：ALiBi/RoPE 一类非学习位置机制会减少位置 embedding 初始化这一项不确定性。BLOOM 仍保留 $0.02$ 小方差矩阵初始化，说明在 Pre-LN decoder-only 架构中，简单小方差仍可扩展到百亿到千亿级，但训练稳定性高度依赖完整工程栈。
+
+\subsection{GLM-130B 与 ChatGLM 路线}
+
+GLM-130B 是清华/智谱发布的 130B 双语模型。与 GPT-style decoder-only 模型不同，它采用 GLM blank infilling 目标，并在百亿以上规模重点处理训练稳定性。论文说明，在 $N$ 层模型中使用 DeepNorm 形式
+\[
+  \mathrm{DeepNorm}(x)=\mathrm{LayerNorm}(\alpha x+\mathrm{Network}(x)),\qquad \alpha=(2N)^{1/2},
+\]
+并对 FFN、value projection 和 output projection 使用带缩放因子的 Xavier normal 初始化，缩放因子为 $(2N)^{-1/2}$；bias 初始化为零 \cite{glm130b}。此外，论文提出 Embedding Gradient Shrink（EGS）：在前向中使用
+\[
+  e_{\mathrm{eff}}=\alpha e+(1-\alpha)\mathrm{stopgrad}(e)
+\]
+来缩小 embedding 层梯度，最终采用 $\alpha=0.1$。
+
+\textbf{论文中的解释}：GLM-130B 论文明确报告，DeepNorm 在 100B 级试验中梯度范数更小、早期不易 spike；EGS 可以显著减少由 embedding 层异常梯度引发的 loss spike。论文还比较了 Pre-LN、Post-LN、Sandwich-LN 等方案，认为 DeepNorm 是最终稳定训练的关键。
+
+\textbf{分析}：GLM-130B 说明“初始化”有时不是单独的权重采样公式，而是残差缩放、归一化形式、特定矩阵缩放和梯度路径共同组成的稳定化系统。EGS 不改变 embedding 的前向初值，却改变其早期学习速度，因此属于训练动态意义上的初始化配套策略。
+
+\subsection{MPT}
+
+MPT 是 MosaicML 发布的开放 decoder-only 模型族。其公开配置默认 `initializer\_range=0.02`，并且 `no\_bias=True`、`learned\_pos\_emb=True`、`norm\_type=low\_precision\_layernorm` \cite{mptdocs}。官方文档把这类默认值作为随机初始化的标准配置，而不是提出特殊的论文级新公式。
+
+\textbf{论文/代码中的解释}：MPT 的重点在 ALiBi、并行层实现和训练系统，不在随机初始化本身。
+
+\textbf{分析}：MPT 的初始化思路和 LLaMA/OPT/BLOOM 很接近，但把很多其他稳定化因素也放进了默认配置。它体现的是“成熟 recipe 可直接复用”，而不是“再发明一套初始化理论”。
+
+\subsection{PaLM}
+
+PaLM 使用 decoder-only Transformer，并采用 SwiGLU、parallel layers、multi-query attention、RoPE、shared input-output embeddings、无 bias 等设计。训练设置中，PaLM 对 kernel weights 使用 fan-in variance scaling：
+\[
+  W\sim \Normal\left(0,\frac{1}{\sqrt{n_{\mathrm{in}}}}\right),
+\]
+embedding 使用 $\Normal(0,1)$；因为输入输出 embedding 共享，pre-softmax logits 乘以 $1/\sqrt{n}$ \cite{palmpaper}。
+
+\textbf{论文中的解释}：PaLM 论文解释了 Adafactor parameter scaling 与初始化的配合：因为权重初始化随 $1/\sqrt{n}$ 缩放，参数尺度学习率近似于 GPT-3 中手动缩小 Adam 学习率；但它不会把 embedding 和 LayerNorm scale 等不同尺度参数同等缩小。论文还说明无 bias 提高了大模型训练稳定性 \cite{palmpaper}。
+
+\textbf{分析}：PaLM 的方案更接近理论上的宽度方差保持。embedding 单独使用 $\Normal(0,1)$ 是因为 embedding 输入前没有 LayerNorm；logits 再缩放则避免共享 embedding 导致输出分布过宽。这体现出“初始化、归一化、权重共享、优化器”是一套联合设计。
+
+\subsection{LLaMA、Llama 2、Llama 3}
+
+LLaMA 系列采用 decoder-only、RMSNorm、SwiGLU、RoPE、无 attention bias、通常不绑定输入输出 embedding。Hugging Face LlamaConfig 中 `initializer\_range` 默认值为 $0.02$，文档说明为初始化所有权重矩阵的标准差 \cite{llamadocs,llamapaper}. PyTorch 实现中通常对 Linear 和 Embedding 使用均值 0、标准差 `initializer\_range` 的 normal 初始化，padding embedding 置零；RMSNorm scale 初始化为一。
+
+\textbf{论文中的解释}：LLaMA 论文强调训练数据、Chinchilla 式 token/parameter 配比、RMSNorm、SwiGLU 和 RoPE，并未对 $0.02$ 初始化给出单独优越性论证。
+
+\textbf{分析}：LLaMA 的成功说明，在 Pre-RMSNorm + RoPE + 无 bias + 合理 warmup 的架构下，统一 $0.02$ 初始化足以训练 7B--65B 量级模型。它不是最“理论自适应”的初始化，但极易迁移，因而成为许多开源模型的默认模板。
+
+\subsection{Falcon}
+
+Falcon-7B/40B 是 Technology Innovation Institute 发布的 decoder-only 模型，使用 multi-query attention、parallel attention/MLP、无 bias 等设计。FalconConfig 中 `initializer\_range` 默认为 $0.02$ \cite{falcondocs}。
+
+\textbf{论文/文档中的解释}：公开文档没有把初始化作为主要贡献；Falcon 的重点在 RefinedWeb 数据、MQA 和推理效率。
+
+\textbf{分析}：Falcon 与 LLaMA 同期，但架构上更强调 MQA 和并行层。它仍采用 $0.02$ 小方差初始化，说明当 Pre-LN/无 bias/稳定优化设置到位时，初始化可以保持简单。
+
+\subsection{Mistral 与 Mixtral}
+
+Mistral-7B 是 LLaMA 风格 decoder-only 模型，加入 sliding-window attention、GQA 和 byte-fallback BPE。Mistral 配置中 `initializer\_range` 为 $0.02$，RMSNorm epsilon 为 $10^{-5}$，通常不绑定 embedding \cite{mistraldocs,mistralpaper}。Mixtral 的 MoE expert 线性层也遵循同类初始化。
+
+\textbf{论文中的解释}：Mistral 论文重点在 GQA、sliding-window attention 和模型质量/效率，没有把初始化作为主要创新。
+
+\textbf{分析}：Mistral/Mixtral 属于“LLaMA 初始化模板 + 架构效率改进”。MoE 模型还额外涉及 router/gating 参数初始化：若 router 初始偏置或权重不当，容易造成专家负载不均。但公开文档中更强调 load balancing loss 和 routing 机制，而非特殊初始化。
+
+\subsection{Qwen、Qwen2、Qwen2.5}
+
+Qwen2 是 Alibaba/Qwen 团队发布的 decoder-only 模型族，包含 dense 和 MoE 变体，采用 RoPE、RMSNorm、SwiGLU/GQA 等现代 LLaMA-like 组件。Hugging Face Qwen2Config 中 `initializer\_range` 默认值为 $0.02$，文档说明为初始化所有权重矩阵的 truncated normal initializer 标准差 \cite{qwen2docs}。
+
+\textbf{论文/文档中的解释}：公开文档没有把初始化作为核心创新，重点在多语言、多代码数据、长上下文和模型规模。
+
+\textbf{分析}：Qwen 选择 $0.02$ 说明 LLaMA-like 初始化已经成为中文/多语言开源 LLM 的事实标准。长上下文版本更多依赖 RoPE scaling、YaRN/NTK 类位置频率调整和继续训练，而不是重新随机初始化主体参数。
+
+\subsection{Baichuan}
+
+Baichuan 系列公开配置中 `initializer\_range=0.02`，属于标准的截断正态小方差初始化 \cite{baichuandocs}。其架构总体上也遵循现代 decoder-only 习惯：RMSNorm、RoPE、SwiGLU 和较少的 bias。
+
+\textbf{分析}：Baichuan 说明 LLaMA-like 初始化已经成为中文开源生态的默认模板之一。公开文档未把初始化作为核心创新。
+
+\subsection{Phi 与 Phi-3}
+
+Microsoft Phi 系列规模较小但数据质量很高。Hugging Face 的 Phi 与 Phi-3 配置都使用 `initializer\_range=0.02`，并将其解释为初始化权重矩阵的标准差 \cite{phidocs,phi3docs}。Phi-3 采用 LLaMA-like 的 RMSNorm、RoPE、SwiGLU/GQA 组件。
+
+\textbf{论文/文档中的解释}：Phi 系列论文强调 textbook-quality data、合成数据和小模型能力涌现，不把初始化作为主要贡献。
+
+\textbf{分析}：Phi 的经验说明，在小到中等规模模型中，数据质量和训练目标可能比精细初始化更能解释最终能力。初始化仍保持行业默认值，有利于把变量集中在数据 recipe 上。
+
+\subsection{DeepSeek LLM、DeepSeek-V2、DeepSeek-V3/R1}
+
+DeepSeek LLM 7B/67B 采用 LLaMA-like 架构，但技术报告中使用了更小的初始化标准差：所有可学习参数随机初始化标准差为 $\sigma=0.006$ \cite{deepseekllm}。DeepSeek-V2 引入 MLA 和 DeepSeekMoE，论文同样说明所有可学习参数用标准差 $0.006$ 随机初始化；由于低秩压缩和细粒度专家会影响层输出尺度，V2 还在压缩 latent vectors 后增加 RMSNorm，并在宽度瓶颈处乘额外 scaling factors 来稳定训练 \cite{deepseekv2paper}。DeepSeek-V3 继续采用 $\sigma=0.006$，并保留这些额外 RMSNorm 和瓶颈缩放，同时引入 auxiliary-loss-free load balancing 与 MTP \cite{deepseekv3paper}。DeepSeek-R1 是在 DeepSeek-V3/Base 之上进行强化学习、冷启动数据和蒸馏得到的 reasoning model，因此其主体初始化属于 checkpoint 继承，而不是从随机权重开始。
+
+需要注意，部分 Hugging Face 兼容配置里的 `initializer\_range` 默认值可能仍显示为 $0.02$；这主要影响从配置新建随机模型时的库默认行为，不应覆盖论文中对实际预训练初始化的说明。
+
+\textbf{论文/文档中的解释}：DeepSeek-V2/V3 论文没有把 $0.006$ 本身作为主要算法贡献，但明确指出低秩压缩和 MoE 宽度瓶颈会改变输出尺度，因此需要额外 RMSNorm 和 scaling factors 来保证稳定训练。DeepSeek-R1 的关键是后训练与 RL 过程，而不是随机初始化。
+
+\textbf{分析}：DeepSeek 系列的较小 $\sigma$ 会降低初始残差分支输出尺度，理论上有利于稳定深层训练，但也可能需要更长 warmup 或更合适 batch size 才能充分学习。V2/V3 的工程复杂度主要来自 MoE routing、低秩 KV 表示、FP8/长上下文位置缩放；这些结构的初始化必须与路由负载均衡、瓶颈缩放和继续训练策略配合。
+
+\subsection{Gemma、Gemma 2、Gemma 3}
+
+Gemma 系列是 Google 发布的开放权重模型，采用 decoder-only、RMSNorm、RoPE、GQA/滑动窗口等现代组件。Hugging Face Gemma 配置中 `initializer\_range` 默认值为 $0.02$ \cite{gemmadocs}。
+
+\textbf{论文/文档中的解释}：Gemma 技术报告更关注训练数据治理、模型尺寸和安全评估；初始化没有被单独作为优势论证。
+
+\textbf{分析}：Gemma 与 LLaMA/Mistral/Qwen 类似，采用成熟的 $0.02$ 小方差初始化。其训练稳定性更多来自架构、优化器、数据和训练 recipe，而非特殊初始化。
+
+\subsection{OLMo}
+
+OLMo 是 Allen AI 发布的开放训练数据、代码和权重的 LLM。OLMo-core 文档说明，默认 normal 初始化下，每个 linear 和 embedding 层从标准差 $0.02$ 的截断正态分布初始化 \cite{olmodocs,olmopaper}。
+
+\textbf{论文/文档中的解释}：OLMo 的贡献主要是开放数据、训练代码、检查点和可复现实验。初始化选择服务于透明复现，而不是作为新算法。
+
+\textbf{分析}：OLMo 的价值在于让研究者可以真正检查初始化、训练动态和中间 checkpoint。对于研究初始化影响，OLMo/Pythia/GPT-NeoX 这类开放中间 checkpoint 的模型比只发布最终权重的模型更有实验价值。
+
+
+\subsection{闭源 GPT-4、Claude、Gemini、PaLM 2 等}
+
+这些模型没有公开完整随机初始化、优化器、warmup、残差缩放、embedding/logit scaling 等训练细节。可以确认的是它们多为从大规模 base model 继续训练、指令调优、RLHF/RLAIF、安全对齐和工具/多模态扩展得到的系统；但不能据此反推出具体 $\sigma$ 或矩阵级初始化。
+
+\textbf{分析}：在综述或实验复现中，应把这些模型标注为“初始化未披露”。如果需要设计自己的训练方案，不应把闭源模型的性能归因到不可见初始化，而应参考公开可复现模型的 recipe。
+
+\section{汇总表}
+
+\small
+\begin{longtable}{p{0.16\linewidth}p{0.31\linewidth}p{0.25\linewidth}p{0.20\linewidth}}
+\caption{代表性大模型初始化策略汇总}\\
+\toprule
+\textbf{模型/家族} & \textbf{随机初始化策略} & \textbf{论文或代码中的理由} & \textbf{简要评价}\\
+\midrule
+\endfirsthead
+\toprule
+\textbf{模型/家族} & \textbf{随机初始化策略} & \textbf{论文或代码中的理由} & \textbf{简要评价}\\
+\midrule
+\endhead
+BERT/RoBERTa & 截断正态，$\sigma=0.02$；bias 0；LayerNorm scale 1。 & 代码明确；论文未做核心消融。 & 适合 12/24 层 encoder；深层扩展需额外稳定化。\\
+GPT-2 & 大部分权重 $\sigma=0.02$，position embedding $\sigma=0.01$；残差层权重乘 $1/\sqrt{N}$。 & 论文称为补偿 residual path 随深度累积。 & 残差缩放是后续深层 GPT 初始化的重要起点。\\
+GPT-3 & 继承 GPT-2 modified initialization 和 Pre-LN。 & 论文直接声明使用 GPT-2 架构细节。 & 适合百层级 decoder-only，但仍依赖完整优化 recipe。\\
+T5/mT5 & Mesh TensorFlow 角色化初始化：embedding $\sigma=1$，attention/MLP 按 $d_{\mathrm{model}},d_{\mathrm{kv}},d_{\mathrm{ff}}$ 缩放。 & 代码注释说明 attention 初始化避免 softmax 前额外缩放。 & 理论性更强，复杂度也更高。\\
+GPT-NeoX/Pythia & FF 输出残差前 $\std=2/(L\sqrt d)$；其他层 small init $\sqrt{2/(5d)}$；Pythia 公开 step 0 和训练中间 checkpoint。 & 论文称防止激活随深度和宽度增长。 & 比 GPT-2 更强的深度/宽度控制；Pythia 适合研究训练动态。\\
+OPT & `init\_std=0.02` 截断正态。 & 文档/配置明确；论文未突出初始化。 & 复现友好，保守简单。\\
+BLOOM & `initializer\_range=0.02` 截断正态；ALiBi 无可学习位置表。 & 文档明确；论文重点不在初始化。 & Pre-LN + ALiBi 下的标准小方差路线。\\
+GLM-130B & DeepNorm 残差缩放；FFN/value/output projection 使用带 $(2N)^{-1/2}$ 缩放的 Xavier normal；EGS 缩小 embedding 梯度。 & 论文称 DeepNorm 和 EGS 降低 gradient norm 与 loss spike。 & 初始化、归一化和梯度路径联合稳定化。\\
+MPT & `initializer\_range=0.02`，并配合无 bias、LayerNorm 和位置配置。 & 文档明确；论文重点不在初始化。 & 成熟小方差 recipe 的工程复用。\\
+PaLM & kernel fan-in scaling；embedding $\Normal(0,1)$；共享 embedding 后 logits 乘 $1/\sqrt n$。 & 论文解释其与 Adafactor parameter scaling 配合，并称无 bias 提升稳定性。 & 初始化、优化器和权重共享联合设计的典型。\\
+LLaMA/Llama & `initializer\_range=0.02`；RMSNorm scale 1；通常无 bias、RoPE。 & 文档明确；论文未单独论证。 & 现代开源 dense LLM 默认模板。\\
+Falcon & `initializer\_range=0.02`；MQA、并行层、无 bias。 & 文档明确；论文重点在数据和效率。 & $0.02$ 小方差在不同 decoder-only 变体上的迁移。\\
+Mistral/Mixtral & LLaMA-like `initializer\_range=0.02`；MoE expert 同类初始化。 & 文档明确；论文重点在 GQA/SWA/MoE。 & 初始化简单，routing 稳定性更多依赖负载均衡损失。\\
+Qwen/Qwen2 & `initializer\_range=0.02`；RMSNorm/RoPE/GQA。 & 文档明确。 & 多语言/长上下文模型中延续 LLaMA-like 经验。\\
+Baichuan & `initializer\_range=0.02`。 & 配置明确；论文未突出初始化。 & 中文开源模型对 LLaMA-like 初始化模板的迁移。\\
+Phi/Phi-3 & `initializer\_range=0.02`。 & 文档明确；论文重点在高质量数据。 & 小模型能力更多由数据 recipe 解释。\\
+DeepSeek LLM/V2/V3 & 所有可学习参数 $\sigma=0.006$；V2/V3 对 MLA/MoE 瓶颈加入额外 RMSNorm 和 scaling factors。 & 论文说明缩放用于稳定低秩压缩和专家结构。 & 小初始化更稳但可能更依赖 warmup；结构新增处需局部稳定化。\\
+Gemma & `initializer\_range=0.02`。 & 配置明确；技术报告未突出初始化。 & 与 LLaMA-like 路线一致。\\
+OLMo & linear/embedding 截断正态 $\sigma=0.02$。 & 文档明确，强调开放可复现。 & 适合研究初始化训练动态。\\
+GPT-4/Claude/Gemini & 未披露。 & 无公开完整训练 recipe。 & 不应臆测；只能作为黑盒能力比较对象。\\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\section{初始化优越性的共性解释}
+
+\subsection{为什么 $0.02$ 很常见}
+
+$0.02$ 并不是从某个唯一理论公式推出的常数，而是 BERT/GPT 时代形成的稳定经验。对于 $d=4096$，fan-in 标准差 $1/\sqrt d\approx 0.0156$，与 $0.02$ 同量级；对于 $d=8192$，$1/\sqrt d\approx 0.011$，$0.02$ 则更大一些。因此，$0.02$ 在中等宽度时近似 fan-in 量级，在超大宽度时偏保守性较弱，需要 Pre-LN/RMSNorm、残差缩放或优化器控制来补偿。
+
+\subsection{为什么残差输出投影需要特殊处理}
+
+在 Pre-LN Transformer 中，每个 block 可以抽象为
+\[
+  x_{l+1}=x_l+f_l(\mathrm{Norm}(x_l)).
+\]
+即使 $\mathrm{Norm}(x_l)$ 尺度稳定，$f_l$ 的输出仍会被累加到 residual stream。如果所有 $f_l$ 初始方差相同且相互近似独立，则
+\[
+  \mathrm{Var}(x_L)\approx \mathrm{Var}(x_0)+\sum_{l=1}^{L}\mathrm{Var}(f_l).
+\]
+因此，把残差分支输出投影缩小到 $O(1/\sqrt L)$ 可以让总方差保持 $O(1)$。GPT-2、GPT-3、GPT-NeoX 的核心理由都可以归结为这一点。
+
+\subsection{为什么 T5/PaLM 不直接使用统一 $0.02$}
+
+T5 和 PaLM 的设计更强调矩阵角色：
+
+\begin{itemize}
+  \item attention logits 对 query/key 的尺度极其敏感，过大会让 softmax 过早尖锐化；
+  \item value/output projection 决定进入残差流的实际内容尺度；
+  \item embedding 若无前置归一化，其初始化尺度直接影响第一层输入；
+  \item 共享输入输出 embedding 时，logits 尺度必须额外控制。
+\end{itemize}
+
+这类策略的优点是尺度更可解释；缺点是实现细节多，迁移到不同架构（GQA、MQA、MoE、parallel layers、gated MLP）时需要重新审视公式。
+
+\section{后训练与扩展阶段的初始化}
+
+\subsection{指令微调与 RLHF}
+
+大模型后训练通常从 base checkpoint 初始化。以 InstructGPT 为例，SFT policy 从 GPT-3 初始化，reward model 与 PPO policy 也从已有模型初始化 \cite{instructgpt}。这种初始化的优势非常明显：预训练语言能力和世界知识被保留，后训练只需改变行为分布、偏好和安全边界。
+
+\textbf{风险}：如果学习率过大或 KL 约束过弱，checkpoint 初始化的优势会被 catastrophic forgetting 抵消；如果新增 reward/value head 初始化尺度过大，RL 初期优势估计会噪声很大。
+
+\subsection{LoRA、adapter 与新 head}
+
+参数高效微调通常冻结 base weights，只初始化少量新增参数。LoRA 的常见做法是让一个低秩矩阵随机初始化、另一个为零，使初始 adapter 对原模型函数近似无影响。这是一种“函数保持初始化”：训练开始时模型输出等于 base model，随后逐步学习增量。
+
+\subsection{词表扩展}
+
+扩展 tokenizer 时，旧 token embedding 从 checkpoint 继承，新 token embedding 常用以下策略：
+
+\begin{itemize}
+  \item 按原模型 embedding 的均值/方差采样；
+  \item 用相关旧 token 的 embedding 平均值初始化；
+  \item 随机 $\Normal(0,0.02^2)$ 或模型配置中的 `initializer\_range`。
+\end{itemize}
+
+若新 token 很多，随机初始化会导致早期 loss 波动，需要较长继续训练；若新 token 是特殊控制符，平均初始化或小方差初始化更稳。
+
+\subsection{长上下文扩展}
+
+RoPE 模型扩展上下文通常不新增大规模可学习参数，而是改变频率、插值或缩放策略，例如 NTK-aware scaling、YaRN、position interpolation 等。主体权重从短上下文 checkpoint 继承，再用长序列数据继续训练。此时“初始化”主要是位置函数和 optimizer state 的再启动问题。
+
+\textbf{分析}：长上下文扩展的关键不是随机权重初始化，而是避免已学到的局部位置关系被破坏。位置缩放过猛会让中短上下文性能下降；继续训练数据如果长文本比例不足，也会导致模型只在形式上支持长上下文。
+
+\section{实践建议}
+
+若从头训练一个 LLaMA-like decoder-only 模型，可以按风险从低到高选择：
+
+\begin{enumerate}
+  \item \textbf{保守默认}：Linear/Embedding 使用 $\Normal(0,0.02^2)$，bias 关闭或置零，RMSNorm scale 为一，RoPE 无随机参数。这与 LLaMA/Mistral/Qwen/Gemma/OLMo 路线一致。
+  \item \textbf{深层模型}：对 attention output projection 和 MLP output projection 额外乘 $1/\sqrt{2L}$，或采用 GPT-NeoX/Megatron 风格 scaled residual init。
+  \item \textbf{宽度变化大或希望理论可解释}：使用 PaLM/T5 式 fan-in 或矩阵角色初始化，同时检查 logits、attention score、residual stream 的初始 RMS。
+  \item \textbf{MoE 模型}：除 expert 矩阵外，重点检查 router 初始化、负载均衡损失、expert capacity 和初期 token 分配熵。router 过早塌缩通常比 expert 权重 $\sigma$ 更危险。
+  \item \textbf{继续训练/后训练}：从 checkpoint 继承主体参数；新增模块采用函数保持初始化，确保训练第 0 步输出尽量等于原模型。
+\end{enumerate}
+
+建议在训练最初几百 step 记录以下诊断量：各层 residual stream RMS、attention logits RMS、MLP 输出 RMS、梯度范数、embedding 梯度、loss spike、MoE expert load。初始化是否合理，通常在这些曲线上比在最终 benchmark 上更早暴露。
+
+\section{结论}
+
+大模型初始化的发展可以概括为三条路线：
+
+\begin{itemize}
+  \item \textbf{经验小方差路线}：BERT/GPT 的 $\sigma=0.02$ 成为大量开源模型默认值，优点是简单稳定。
+  \item \textbf{残差深度控制路线}：GPT-2/GPT-3/GPT-NeoX 明确处理 residual path accumulation，适合更深 decoder-only 模型。
+  \item \textbf{结构化尺度路线}：T5/PaLM 根据 attention、MLP、embedding、logits 的不同角色设计不同尺度，更可解释但实现复杂。
+\end{itemize}
+
+从当前公开模型看，初始化已经不是单个常数的选择，而是架构、归一化、位置编码、残差路径、优化器、warmup 和 checkpoint 继承共同构成的训练 recipe。若要开展新的“大模型初始化”研究，最有价值的方向不是单独比较 $0.02$ 与 $0.01$，而是研究初始化尺度如何与深度、宽度、Pre-LN/RMSNorm、MoE routing、长上下文 RoPE scaling 和优化器参数尺度共同作用。
+
+\begin{thebibliography}{99}
+
+\bibitem{transformer}
+Ashish Vaswani et al.
+\newblock Attention Is All You Need.
+\newblock NeurIPS 2017.
+\newblock \url{https://arxiv.org/abs/1706.03762}
+
+\bibitem{bertcode}
+Google Research.
+\newblock BERT official modeling code.
+\newblock \url{https://github.com/google-research/bert/blob/master/modeling.py}
+
+\bibitem{bertpaper}
+Jacob Devlin et al.
+\newblock BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding.
+\newblock NAACL 2019.
+\newblock \url{https://arxiv.org/abs/1810.04805}
+
+\bibitem{gpt2paper}
+Alec Radford et al.
+\newblock Language Models are Unsupervised Multitask Learners.
+\newblock OpenAI, 2019.
+\newblock \url{https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf}
+
+\bibitem{gpt2code}
+OpenAI.
+\newblock GPT-2 official model code.
+\newblock \url{https://github.com/openai/gpt-2/blob/master/src/model.py}
+
+\bibitem{gpt3paper}
+Tom Brown et al.
+\newblock Language Models are Few-Shot Learners.
+\newblock NeurIPS 2020.
+\newblock \url{https://arxiv.org/abs/2005.14165}
+
+\bibitem{t5paper}
+Colin Raffel et al.
+\newblock Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer.
+\newblock JMLR 2020.
+\newblock \url{https://arxiv.org/abs/1910.10683}
+
+\bibitem{t5hfcode}
+Hugging Face Transformers.
+\newblock T5 model initialization source.
+\newblock \url{https://huggingface.co/transformers/v4.0.0/_modules/transformers/models/t5/modeling_t5.html}
+
+\bibitem{gptneoxpaper}
+Sid Black et al.
+\newblock GPT-NeoX-20B: An Open-Source Autoregressive Language Model.
+\newblock BigScience Workshop, ACL 2022.
+\newblock \url{https://aclanthology.org/2022.bigscience-1.9/}
+
+\bibitem{pythiapaper}
+Sid Black et al.
+\newblock Pythia: A Suite for Analyzing Large Language Models Across Training and Scaling.
+\newblock PMLR 2023.
+\newblock \url{https://proceedings.mlr.press/v202/biderman23a.html}
+
+\bibitem{pythiarepo}
+EleutherAI.
+\newblock Pythia repository.
+\newblock \url{https://github.com/EleutherAI/pythia}
+
+\bibitem{optdocs}
+Hugging Face Transformers.
+\newblock OPT documentation.
+\newblock \url{https://huggingface.co/docs/transformers/main/model_doc/opt}
+
+\bibitem{optpaper}
+Susan Zhang et al.
+\newblock OPT: Open Pre-trained Transformer Language Models.
+\newblock arXiv 2022.
+\newblock \url{https://arxiv.org/abs/2205.01068}
+
+\bibitem{bloomdocs}
+Hugging Face Transformers.
+\newblock BLOOM documentation.
+\newblock \url{https://huggingface.co/docs/transformers/model_doc/bloom}
+
+\bibitem{glm130b}
+Aohan Zeng et al.
+\newblock GLM-130B: An Open Bilingual Pre-trained Model.
+\newblock ICLR 2023.
+\newblock \url{https://arxiv.org/abs/2210.02414}
+
+\bibitem{mptdocs}
+Hugging Face Transformers.
+\newblock MPT documentation.
+\newblock \url{https://huggingface.co/docs/transformers/en/model_doc/mpt}
+
+\bibitem{falcondocs}
+Hugging Face Transformers.
+\newblock Falcon documentation.
+\newblock \url{https://huggingface.co/docs/transformers/model_doc/falcon}
+
+\bibitem{baichuandocs}
+BaiChuan-Inc.
+\newblock Baichuan-7B configuration and modeling files.
+\newblock \url{https://huggingface.co/baichuan-inc/Baichuan-7B/blob/main/config.json}
+\newblock \url{https://huggingface.co/baichuan-inc/Baichuan-7B/blob/main/modeling_baichuan.py}
+
+\bibitem{phidocs}
+Hugging Face Transformers.
+\newblock Phi documentation.
+\newblock \url{https://huggingface.co/docs/transformers/model_doc/phi}
+
+\bibitem{phi3docs}
+Hugging Face Transformers.
+\newblock Phi-3 documentation.
+\newblock \url{https://huggingface.co/docs/transformers/model_doc/phi3}
+
+\bibitem{bloompaper}
+BigScience Workshop.
+\newblock BLOOM: A 176B-Parameter Open-Access Multilingual Language Model.
+\newblock arXiv 2022.
+\newblock \url{https://arxiv.org/abs/2211.05100}
+
+\bibitem{palmpaper}
+Aakanksha Chowdhery et al.
+\newblock PaLM: Scaling Language Modeling with Pathways.
+\newblock JMLR 2023.
+\newblock \url{https://arxiv.org/abs/2204.02311}
+
+\bibitem{llamapaper}
+Hugo Touvron et al.
+\newblock LLaMA: Open and Efficient Foundation Language Models.
+\newblock arXiv 2023.
+\newblock \url{https://arxiv.org/abs/2302.13971}
+
+\bibitem{llamadocs}
+Hugging Face Transformers.
+\newblock LLaMA documentation.
+\newblock \url{https://huggingface.co/docs/transformers/model_doc/llama}
+
+\bibitem{mistralpaper}
+Albert Q. Jiang et al.
+\newblock Mistral 7B.
+\newblock arXiv 2023.
+\newblock \url{https://arxiv.org/abs/2310.06825}
+
+\bibitem{mistraldocs}
+Hugging Face Transformers.
+\newblock Mistral documentation.
+\newblock \url{https://huggingface.co/docs/transformers/model_doc/mistral}
+
+\bibitem{qwen2docs}
+Hugging Face Transformers.
+\newblock Qwen2 documentation.
+\newblock \url{https://huggingface.co/docs/transformers/model_doc/qwen2}
+
+\bibitem{deepseekllm}
+DeepSeek-AI.
+\newblock DeepSeek LLM: Scaling Open-Source Language Models with Longtermism.
+\newblock arXiv 2024.
+\newblock \url{https://arxiv.org/abs/2401.02954}
+
+\bibitem{deepseekv2paper}
+DeepSeek-AI.
+\newblock DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model.
+\newblock arXiv 2024.
+\newblock \url{https://arxiv.org/abs/2405.04434}
+
+\bibitem{deepseekv2docs}
+Hugging Face Transformers.
+\newblock DeepSeek-V2 documentation and configuration.
+\newblock \url{https://huggingface.co/docs/transformers/model_doc/deepseek_v2}
+
+\bibitem{deepseekv3paper}
+DeepSeek-AI.
+\newblock DeepSeek-V3 Technical Report.
+\newblock arXiv 2024.
+\newblock \url{https://arxiv.org/abs/2412.19437}
+
+\bibitem{gemmadocs}
+Hugging Face Transformers.
+\newblock Gemma documentation and configuration.
+\newblock \url{https://huggingface.co/docs/transformers/model_doc/gemma}
+
+\bibitem{olmopaper}
+Dirk Groeneveld et al.
+\newblock OLMo: Accelerating the Science of Language Models.
+\newblock arXiv 2024.
+\newblock \url{https://arxiv.org/abs/2402.00838}
+
+\bibitem{olmodocs}
+Allen AI.
+\newblock OLMo-core Transformer initialization documentation.
+\newblock \url{https://olmo-core.readthedocs.io/en/stable/nn/transformer.html}
+
+\bibitem{instructgpt}
+Long Ouyang et al.
+\newblock Training language models to follow instructions with human feedback.
+\newblock NeurIPS 2022.
+\newblock \url{https://arxiv.org/abs/2203.02155}
+
+\end{thebibliography}
+
+\end{document}
