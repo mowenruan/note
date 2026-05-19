@@ -1,0 +1,109 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{amsmath,amssymb,booktabs,geometry,array}
+\geometry{margin=2.2cm}
+
+\title{MFU 简介：计算方法与提升思路}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{什么是 MFU}
+MFU 是 \textbf{Model FLOPs Utilization} 的缩写，用来衡量模型训练或推理时，实际使用到的计算吞吐相对于硬件理论峰值的比例。它的直观含义是：你的算力有多少真正被模型计算用掉了。
+
+\begin{equation}
+\mathrm{MFU} = \frac{\text{实际持续 FLOPs/s}}{\text{理论峰值 FLOPs/s}}
+\end{equation}
+
+MFU 的取值通常在 $0$ 到 $1$ 之间，也常写成百分比。数值越高，说明硬件利用越充分。
+
+\section{如何计算 MFU}
+MFU 的计算通常分成三步：
+
+\begin{enumerate}
+  \item 统计一段稳定运行区间的时间 $\Delta t$。
+  \item 统计这段时间内模型处理的 token 数 $N_{\text{tok}}$。
+  \item 估算模型每个 token 需要的 FLOPs，再除以硬件峰值。
+\end{enumerate}
+
+对稠密的 decoder-only Transformer，训练阶段常用的粗略估算是：
+
+\begin{equation}
+F_{\text{tok}} \approx 6N
+\end{equation}
+
+其中 $N$ 是模型参数量，通常指不含 embedding 的有效参数量。这里的 $6$ 来自一个常见的训练 FLOPs 近似：前向传播中，每个参数对应的乘加操作通常按约 $2$ FLOPs 计；反向传播还需要计算权重梯度和激活梯度，开销大约是前向的 2 倍，也就是约 $4$ FLOPs。两者相加后，就得到每个参数每个 token 约 $6$ FLOPs 的经验估计。
+
+更具体地说，在一个线性层 $y = xW + b$ 中，反向传播主要包含两类计算：
+\begin{itemize}
+  \item \textbf{权重梯度}：计算 $\nabla_W L$ 和 $\nabla_b L$，也就是参数 $W$ 和 $b$ 应该如何更新。它由当前层输入 $x$ 和上游梯度 $\nabla_y L$ 共同决定，形式上常写成 $\nabla_W L = x^\top \nabla_y L$。
+  \item \textbf{激活梯度}：计算 $\nabla_x L$，也就是把误差信号继续传回前一层，让更早的层也能继续求导，形式上常写成 $\nabla_x L = \nabla_y L \, W^\top$。
+\end{itemize}
+
+这两部分通常都要依赖大规模矩阵乘法，因此反向传播的成本会和前向传播处在同一个量级。把这些开销合并起来后，就得到每个参数每个 token 约 $6$ FLOPs 的经验估计。它是一个实用近似，而不是严格常数，具体数值会随架构、序列长度和实现方式变化。
+
+于是，实际计算吞吐可以写成：
+
+\begin{equation}
+\text{实际持续 FLOPs/s} \approx \frac{F_{\text{tok}} \cdot N_{\text{tok}}}{\Delta t}
+\end{equation}
+
+进一步得到：
+
+\begin{equation}
+\mathrm{MFU} \approx \frac{F_{\text{tok}} \cdot N_{\text{tok}}}{\Delta t \cdot P_{\text{peak}}}
+\end{equation}
+
+其中 $P_{\text{peak}}$ 是所用硬件在对应精度下的理论峰值 FLOPs/s。
+
+\subsection*{一个简单的计算流程}
+\begin{enumerate}
+  \item 先确认硬件峰值，且要和实际训练精度一致，例如 BF16、FP16 或 FP8。
+  \item 从训练日志中取一个稳定区间，不要把 warmup、数据加载抖动和首步编译时间混进去。
+  \item 用吞吐量换算 token/s。如果日志里记录的是 samples/s，需要乘上序列长度和有效 token 比例。
+  \item 用模型的每 token FLOPs 估算值乘以 token/s，得到实际 FLOPs/s。
+  \item 用实际 FLOPs/s 除以理论峰值 FLOPs/s，得到 MFU。
+\end{enumerate}
+
+\subsection*{例子}
+假设一个 7B 参数模型，稳定吞吐为 4000 tokens/s，硬件峰值为 312 TFLOPs/s，则：
+
+\begin{equation}
+\text{实际持续 FLOPs/s} \approx 6 \times 7\times 10^9 \times 4000 = 1.68 \times 10^{14}
+\end{equation}
+
+\begin{equation}
+\mathrm{MFU} \approx \frac{1.68\times 10^{14}}{3.12\times 10^{14}} \approx 53.8\%
+\end{equation}
+
+\section{如何提高 MFU}
+提高 MFU 的核心，是让 GPU 尽量少等、少空转、少跑低效算子。常见做法如下。
+
+\begin{itemize}
+  \item \textbf{提高算子效率}：优先使用 BF16/FP16/FP8，确保矩阵维度适合 Tensor Core。
+  \item \textbf{减少小算子和 Python 开销}：尽量做 kernel fusion，减少碎片化操作。
+  \item \textbf{提高有效批量}：适当增大 batch size 或 sequence length，提升并行度和计算密度。
+  \item \textbf{减少通信等待}：优化数据并行、张量并行、流水并行中的 all-reduce 和同步开销，尽量重叠计算与通信。
+  \item \textbf{减少数据管线瓶颈}：提高数据预处理、tokenization、读取和预取效率，避免 GPU 等数据。
+  \item \textbf{减少 padding 浪费}：对变长序列做 packing，或尽量让 batch 内样本长度更接近。
+  \item \textbf{使用高效实现}：采用更快的 attention、MLP 和优化器实现，例如经过优化的 fused kernel。
+  \item \textbf{保持负载均衡}：确保各卡、各 stage、各 rank 的工作量尽量一致。
+\end{itemize}
+
+\subsection*{需要注意的点}
+有些手段会改善吞吐，但不一定直接提高 MFU 的定义值。例如激活检查点会增加重计算，可能降低按 FLOPs 口径统计的 MFU，但它可以降低显存占用，从而让更大的 batch 或更长的序列跑起来。实际工作中，应该同时看 \textbf{MFU} 和 \textbf{端到端吞吐}。
+
+\section{常见误区}
+\begin{itemize}
+  \item 只看峰值，不看精度口径：BF16、FP16、TF32、FP8 的峰值不同。
+  \item 用很短的时间窗口算 MFU：容易被 warmup、缓存和调度抖动污染。
+  \item 忽略 padding 和无效 token：会高估真实计算效率。
+  \item 把模型 FLOPs 估算当成绝对值：$6N$ 只是常用近似，具体架构要按实际修正。
+\end{itemize}
+
+\section{总结}
+MFU 是衡量硬件利用率的常用指标。计算时，本质上就是把模型在单位时间内完成的有效 FLOPs，与硬件理论峰值做比较。要提高 MFU，重点是减少等待、减少低效算子、提高并行度，并让训练过程更接近硬件的最佳工作点。
+
+\end{document}
