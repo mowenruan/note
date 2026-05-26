@@ -105,6 +105,60 @@ PaLM 对 kernel weights 使用 fan-in variance scaling：
 \]
 embedding 使用 $\Normal(0,1)$；由于输入输出 embedding 共享，pre-softmax logits 再乘以 $1/\sqrt{n}$ \cite{palmpaper}。PaLM 论文进一步解释，Adafactor 的 parameter scaling 会按参数矩阵 RMS 调整学习率；这与 GPT-3 手动缩放 Adam 学习率有相似效果，但能让 embedding 和 LayerNorm scale 等不同尺度参数不被同样缩小。
 
+\section{当前最常用的初始化方法：LLaMA-like 的 $0.02$ 小方差初始化}
+
+从当前公开 dense decoder-only LLM 的配置看，最常用的默认初始化不是复杂的矩阵角色公式，而是 LLaMA-like recipe：对 Linear 和 Embedding 权重使用零均值、标准差约为 $0.02$ 的正态或截断正态初始化，bias 关闭或初始化为零，RMSNorm/LayerNorm 的 scale 初始化为一，RoPE/ALiBi 这类位置编码不引入大规模可学习位置表。LLaMA、Mistral、Qwen、Gemma、OLMo、OPT、BLOOM、Falcon、MPT、Phi 等公开模型或库配置都可归入这一类 \cite{llamadocs,mistraldocs,qwen2docs,gemmadocs,olmodocs,optdocs,bloomdocs,falcondocs,mptdocs,phidocs}。
+
+一个典型实现可以写成：
+\[
+  W_{\mathrm{linear}},E_{\mathrm{tok}}\sim \Normal(0,0.02^2),
+\]
+\[
+  b=0,\qquad \gamma_{\mathrm{norm}}=1,\qquad \beta_{\mathrm{norm}}=0,
+\]
+其中 $E_{\mathrm{tok}}$ 是 token embedding，$\gamma_{\mathrm{norm}}$ 是 RMSNorm 或 LayerNorm 的可学习缩放参数。若存在 padding token，padding embedding 通常额外置零；若模型不使用 bias，则 $b$ 这一项直接不存在。对于未绑定的 LM head，常按同样标准差初始化；对于绑定输入输出 embedding 的模型，LM head 继承 token embedding 权重。
+
+另外，工程实现中常把一个 Transformer block 的 attention output projection 和 MLP output projection 看作两个残差分支，因此 $N=2L$，常写成
+\[
+  \sigma_{\mathrm{residual\ output}}=\frac{0.02}{\sqrt{2L}},
+\]
+其中 $L$ 是 block 数。
+
+\subsection{为什么它成为最常用默认值}
+
+\textbf{第一，$0.02$ 与常见宽度下的 fan-in 尺度同量级。} 对线性层 $y=xW$，若 $x_i$ 和 $W_{ij}$ 独立，则
+\[
+  \mathrm{Var}(y_j)\approx n_{\mathrm{in}}\mathrm{Var}(x_i)\mathrm{Var}(W_{ij}).
+\]
+fan-in 初始化会取 $\std(W)=1/\sqrt{n_{\mathrm{in}}}$。当 hidden size 为 $4096$ 时，$1/\sqrt{4096}=0.015625$；当 hidden size 为 $2048$ 时，$1/\sqrt{2048}\approx0.022$。因此 $0.02$ 对大量 1B--10B 级模型来说接近 fan-in 量级。它不是严格随宽度自适应的公式，但处在一个经验上足够小、又不至于让早期信号过弱的区间。
+
+\textbf{第二，Pre-LN/RMSNorm 降低了统一初始化的风险。} LLaMA-like block 通常写成
+\[
+  x_{\ell+1}=x_\ell+\mathrm{Attn}(\mathrm{RMSNorm}(x_\ell)),
+\]
+\[
+  x_{\ell+2}=x_{\ell+1}+\mathrm{MLP}(\mathrm{RMSNorm}(x_{\ell+1})).
+\]
+每个 attention 或 MLP 子层看到的输入先被归一化，因此即使 residual stream 的整体 RMS 在训练中缓慢变化，子层输入尺度仍较稳定。这让“所有矩阵使用同一个 $0.02$”比在 Post-LN 或无归一化结构中更容易工作。RMSNorm scale 初始化为 $1$ 的原因也在这里：第 0 步不主动放大或缩小归一化后的表示，让随机线性层的尺度主要由 $0.02$ 控制。
+
+\textbf{第三，小方差让 attention 和 MLP 在训练初期不过早饱和。} query/key 权重若初始化过大，attention logits
+\[
+  \frac{qk^\top}{\sqrt{d_k}}
+\]
+会在 step 0 就有较大方差，softmax 可能过早变尖，导致梯度集中在少数 token 上。MLP 的 gate/up projection 若过大，SwiGLU/GELU 激活也可能进入强非线性区间。$0.02$ 的作用是让 attention pattern 和 MLP gate 在训练初期保持温和，避免一开始就产生过大的残差写回量。
+
+\textbf{第四，无 bias 或零 bias 可以减少初始分布偏移。} bias 如果随机初始化，会给每层引入与输入无关的固定偏移；即使 bias 为常数非零，也可能在深层残差路径中累积。现代 LLM 常直接移除 bias，或者把 bias 初始化为零，使初始网络尽量保持零均值扰动。这样 residual stream 的变化主要来自输入相关的线性变换，而不是层层叠加的常数项。
+
+\textbf{第五，RoPE/ALiBi 减少了位置 embedding 初始化的不确定性。} BERT/GPT-2 这类模型需要初始化可学习 absolute position embedding；LLaMA-like 模型通常使用 RoPE，BLOOM 使用 ALiBi。它们把位置结构放到 attention 计算或固定偏置中，而不是学习一个大的位置表。因此初始化 recipe 主要关注 token embedding 和线性层，少了一个可能影响早期尺度的可学习模块。
+
+\textbf{第六，它简单、可迁移、便于复现。} 复杂的 T5/PaLM/GPT-NeoX 式初始化需要根据 query/key/value、MLP、输出投影、并行层、GQA/MQA 或 MoE 结构重新检查公式。统一 $0.02$ 则几乎不依赖具体矩阵角色，改动 hidden size、层数、head 数或 MLP expansion ratio 时实现成本低。对开源模型和训练框架来说，这种可复现性本身很重要。
+
+\subsection{它的边界条件}
+
+统一 $0.02$ 不代表它在所有规模上最优。它没有显式处理深度方向的残差累积；如果层数很深，attention output projection 和 MLP output projection 仍可能需要 GPT-2/GPT-NeoX 式的 $1/\sqrt{L}$ 或 $1/\sqrt{2L}$ 缩放。它也没有显式处理 MoE router、低秩压缩瓶颈、共享 embedding logits 尺度等特殊结构；这些场景可能需要额外 RMSNorm、logit scaling、router bias/load balancing 设计或更小的初始化标准差。DeepSeek 系列采用 $\sigma=0.006$ 就说明，在特定架构和训练系统中，更小的随机初始化也可能是合理选择 \cite{deepseekllm,deepseekv2paper,deepseekv3paper}。
+
+因此，在实践中可以把 LLaMA-like $0.02$ 初始化理解为“当前最常用、最稳妥的开源默认起点”，而不是一个普适最优常数。若训练曲线出现早期 loss spike、attention logits 过大、residual RMS 随层数快速上升或 MoE 负载塌缩，就应该优先检查残差输出投影缩放、warmup、梯度裁剪和结构特定模块的初始化，而不是只在 $0.02$ 附近微调标准差。
+
 
 \section{代表性模型逐项说明}
 
