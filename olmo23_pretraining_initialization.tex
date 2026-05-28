@@ -1,0 +1,427 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\geometry{margin=2.2cm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=teal
+}
+\setlist[itemize]{leftmargin=2em}
+\setlist[enumerate]{leftmargin=2em}
+\renewcommand{\arraystretch}{1.18}
+
+\newcommand{\Normal}{\mathcal{N}}
+\newcommand{\TruncNormal}{\operatorname{TruncNormal}}
+\newcommand{\std}{\operatorname{std}}
+\newcommand{\RMS}{\operatorname{RMS}}
+
+\title{OLMo 2 与 OLMo 3 预训练初始化方法详解}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文只讨论 OLMo 2 和 OLMo 3 \emph{base model 预训练}中的参数初始化，不讨论 SFT、DPO、RLVR 等后训练阶段。结论先行：OLMo 2 和 OLMo 3 的官方可复现训练配方都采用工程上很朴素的 ``normal'' 初始化路线。在线性层和 embedding 层上，核心做法是零均值、标称标准差 $0.02$、截断到 $\pm 3\sigma$ 的正态初始化；bias 若存在则置零；RMSNorm/LayerNorm 的缩放参数初始化为 $1$，偏置为 $0$ 或直接不存在；RoPE/sliding-window attention/YaRN RoPE scaling 不引入随机可学习位置表。OLMo 3 在架构上继承 OLMo 2 的初始化默认值，主要改变数据、训练阶段和注意力窗口。预训练后续的 midtraining、annealing、long-context 阶段不是重新随机初始化主体参数，而是从前一阶段 checkpoint 继承。
+\end{abstract}
+
+\section{范围与资料口径}
+
+为了避免把不同阶段混在一起，本文把“初始化”分为两类：
+
+\begin{enumerate}
+  \item \textbf{随机初始化}：从 step 0 开始训练 base model 时，如何为 embedding、attention、MLP、LM head、归一化层等参数采样初值。
+  \item \textbf{checkpoint 继承}：stage 2 annealing/midtraining、long-context 扩展或后训练阶段，从已有 checkpoint 加载参数。此时配置文件里仍可能保留 \texttt{init\_std=0.02} 之类字段，但主体参数会被 checkpoint 覆盖，不能把它解释成“重新随机初始化”。
+\end{enumerate}
+
+本文以官方训练配置和代码为主。OLMo 2 7B/13B 使用旧 \texttt{allenai/OLMo} trainer；OLMo 2 32B 与 OLMo 3 使用新的 \texttt{allenai/OLMo-core} trainer。两个代码库命名略有差异，但官方配置选择的实际初始化非常接近：线性层和 embedding 权重使用 $\sigma=0.02$ 的截断正态。
+
+\section{共同初始化公式}
+
+\subsection{权重矩阵}
+
+OLMo 2/3 的主线初始化可以写为
+\[
+  W \sim \TruncNormal\left(0,\,0.02^2;\,[-0.06,0.06]\right),
+\]
+也就是
+\[
+  \mu=0,\qquad \sigma=0.02,\qquad a=-3\sigma,\qquad b=3\sigma .
+\]
+这里的 $\sigma=0.02$ 是传给 PyTorch \texttt{trunc\_normal\_} 的标称标准差。由于截断区间为 $\pm3\sigma$，实际采样后标准差会略小于 $0.02$，但差异很小；工程上通常仍把它称作 ``std 0.02 truncated normal''。
+
+在旧 \texttt{OLMo} trainer 中，配置项为
+\[
+  \texttt{init\_fn=normal},\qquad
+  \texttt{init\_std=0.02},\qquad
+  \texttt{init\_cutoff\_factor=3}.
+\]
+代码中的 \texttt{init\_normal()} 会在 \texttt{init\_cutoff\_factor} 非空时调用截断正态。因此旧配置里的 ``normal'' 不是无限支撑的普通正态，而是带 $3\sigma$ cutoff 的正态初始化。
+
+在 \texttt{OLMo-core} 中，\texttt{InitMethod.normal} 的注释直接写明：每个 linear 和 embedding 层从标准差 $0.02$ 的截断正态分布初始化。底层 \texttt{init\_linear()} 对线性层权重调用
+\[
+  \texttt{trunc\_normal\_(mean=0,\ std=0.02,\ a=-0.06,\ b=0.06)} .
+\]
+
+\subsection{bias、归一化层与位置编码}
+
+若线性层存在 bias，则
+\[
+  b=0.
+\]
+不过 OLMo 2/3 的 LLaMA-like 配置通常关闭线性层 bias，因此多数线性层根本没有 bias 参数。
+
+归一化层使用 RMSNorm 或相关变体。可学习缩放参数初始化为
+\[
+  \gamma=1,
+\]
+如果存在偏置则初始化为
+\[
+  \beta=0.
+\]
+OLMo 2/3 配置中常见设置是 RMSNorm、无 bias、$\epsilon=10^{-6}$。QK norm 中的归一化参数也遵循同类默认初始化。
+
+位置编码方面，OLMo 2/3 使用 RoPE，而不是大的可学习 absolute position embedding 表。因此 RoPE 本身没有随机初始化的权重。OLMo 3 的 long-context 阶段使用 YaRN RoPE scaling 调整频率/缩放规则，这也是确定性的配置变化，不是新增随机参数。
+
+\section{OLMo 2 的预训练初始化}
+
+\subsection{OLMo 2 7B 与 13B：旧 OLMo trainer}
+
+OLMo 2 7B 和 13B 的 stage 1 配置位于旧 \texttt{allenai/OLMo} 仓库的 \texttt{configs/official-1124} 目录。两个模型的初始化字段相同：
+
+\begin{center}
+\begin{tabular}{llllll}
+\toprule
+模型 & $d_{\mathrm{model}}$ & 层数 & 注意力头数 & MLP hidden & 初始化字段 \\
+\midrule
+OLMo 2 7B & 4096 & 32 & 32 & 22016 & \texttt{normal}, $0.02$, cutoff $3$ \\
+OLMo 2 13B & 5120 & 40 & 40 & 27648 & \texttt{normal}, $0.02$, cutoff $3$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+更具体地说，stage 1 从随机权重开始，主要参数按如下方式初始化：
+
+\begin{itemize}
+  \item token embedding：$\TruncNormal(0,0.02^2;[-0.06,0.06])$；
+  \item query/key/value projection：同样的 $0.02$ 截断正态；
+  \item attention output projection：同样的 $0.02$ 截断正态；
+  \item SwiGLU/MLP 的输入、门控和输出投影：同样的 $0.02$ 截断正态；
+  \item 未绑定的输出 LM head：同样的 $0.02$ 截断正态；
+  \item bias：若存在则为 $0$，但配置中 \texttt{include\_bias=false}；
+  \item RMSNorm scale：$1$；norm bias 关闭或为 $0$。
+\end{itemize}
+
+OLMo 2 7B/13B 配置中 \texttt{weight\_tying=false}，所以输入 embedding 与输出 LM head 不共享参数。输出 head 因而也需要独立初始化。配置中 \texttt{rope=true}、\texttt{alibi=false}，说明没有可学习位置 embedding 需要随机初始化。
+
+\subsection{OLMo 2 7B/13B 的第二阶段}
+
+OLMo 2 7B/13B 的 stage 2 配置仍然保留 \texttt{init\_fn=normal}、\texttt{init\_std=0.02}、\texttt{init\_cutoff\_factor=3}，但 stage 2 配置同时给出 \texttt{load\_path}，例如 7B stage 2 从 stage 1 的 \texttt{step928646-unsharded} checkpoint 加载，13B stage 2 从 \texttt{step596057-unsharded} checkpoint 加载。也就是说，stage 2 的主体参数不是重新随机采样，而是继承 stage 1 权重。配置中的初始化字段只是模型对象构造时仍然需要的默认值；加载 checkpoint 后，对应权重会被覆盖。
+
+因此，描述 OLMo 2 7B/13B 预训练初始化时，应写成：
+
+\begin{quote}
+随机初始化发生在 stage 1；stage 2 annealing/midtraining 从 stage 1 checkpoint 继承参数，不重新初始化主体网络。
+\end{quote}
+
+\subsection{OLMo 2 32B：OLMo-core trainer}
+
+OLMo 2 32B 使用 \texttt{OLMo-core}。官方 stage 1 脚本调用
+\[
+  \texttt{TransformerConfig.olmo2\_32B(...)}
+\]
+并且没有传入 \texttt{init\_method} 或 \texttt{init\_std} 覆盖项。因此它使用 \texttt{TransformerConfig} 默认值：
+\[
+  \texttt{init\_method=InitMethod.normal},\qquad
+  \texttt{init\_std=0.02}.
+\]
+\texttt{olmo2\_32B} 的主要结构参数为
+\[
+  d_{\mathrm{model}}=5120,\quad L=64,\quad n_{\mathrm{heads}}=40,\quad n_{\mathrm{kv\ heads}}=8,\quad d_{\mathrm{ff}}=27648.
+\]
+它通过 \texttt{llama\_like()} 构造 dense decoder-only 模型，默认采用 RMSNorm、RoPE、SwiGLU/MLP、无线性 bias、未绑定 LM head，并将 block 类型设为 \texttt{reordered\_norm}，启用 QK norm。
+
+在 \texttt{InitMethod.normal} 下，OLMo 2 32B 的初始化是：
+
+\begin{itemize}
+  \item embedding：$\TruncNormal(0,0.02^2;[-0.06,0.06])$；
+  \item attention 的 Q/K/V projection：同样的 $0.02$ 截断正态；
+  \item attention output projection：同样的 $0.02$ 截断正态；
+  \item MLP 的 \texttt{w1}、\texttt{w2}、\texttt{w3}：同样的 $0.02$ 截断正态；
+  \item final LM head 的 \texttt{w\_out}：同样的 $0.02$ 截断正态；
+  \item bias：若存在则为 $0$，但 OLMo 2 32B 配置中主要线性层无 bias；
+  \item RMSNorm/QK norm/final norm：scale 为 $1$，bias 关闭或为 $0$。
+\end{itemize}
+
+需要特别注意：\texttt{OLMo-core} 还实现了 \texttt{llama}、\texttt{llama\_depth}、\texttt{fan\_in} 等初始化方法。例如 \texttt{llama} 会对某些输出层做深度相关缩放。但 OLMo 2 32B 官方预训练脚本没有选择这些方法，而是保留默认的 \texttt{normal}。因此不能把 OLMo 2 32B 写成 GPT-2/Megatron 式的
+\[
+  \frac{0.02}{\sqrt{2L}}
+\]
+残差输出投影初始化；官方脚本使用的是统一 $0.02$ 截断正态。
+
+OLMo 2 32B 的第二阶段脚本是 annealing 配方，它使用 \texttt{load\_strategy=always} 和外部 checkpoint 路径加载 stage 1 权重。和 7B/13B 一样，第二阶段不重新随机初始化主体模型。
+
+\section{OLMo 3 的预训练初始化}
+
+\subsection{OLMo 3 继承 OLMo 2 的初始化默认值}
+
+OLMo 3 的官方 \texttt{OLMo-core} 配置函数直接复用 OLMo 2 架构函数：
+\[
+  \texttt{olmo3\_7B(...)} \rightarrow \texttt{olmo2\_7B(...)}
+\]
+\[
+  \texttt{olmo3\_32B(...)} \rightarrow \texttt{olmo2\_32B(...)}
+\]
+然后额外加入 sliding-window attention 配置和 FlashAttention 后端。由于 \texttt{olmo3\_7B} 与 \texttt{olmo3\_32B} 没有覆盖 \texttt{init\_method}，它们同样继承
+\[
+  \texttt{init\_method=InitMethod.normal},\qquad
+  \texttt{init\_std=0.02}.
+\]
+
+因此 OLMo 3 stage 1 从头预训练时的随机初始化与 OLMo 2 32B 的 \texttt{OLMo-core} 实现一致：
+\[
+  W_{\mathrm{linear}},E_{\mathrm{tok}},W_{\mathrm{LM\ head}}
+  \sim
+  \TruncNormal(0,0.02^2;[-0.06,0.06]).
+\]
+
+\subsection{OLMo 3 7B}
+
+OLMo 3 7B 的官方 stage 1 pretraining 脚本分成两个文件：第一部分从随机初始化开始，第二部分从第一部分的 checkpoint 继续训练。第一部分调用
+\[
+  \texttt{TransformerConfig.olmo3\_7B(...)}
+\]
+且没有 \texttt{load\_path}，因此这是随机初始化发生的位置。第二部分脚本设置 \texttt{load\_path} 并加载优化器与 trainer 状态，用于延长训练日程，不代表重新初始化。
+
+OLMo 3 7B 的核心结构是
+\[
+  d_{\mathrm{model}}=4096,\quad L=32,\quad n_{\mathrm{heads}}=32,\quad n_{\mathrm{kv\ heads}}=32.
+\]
+初始化规则为：
+
+\begin{itemize}
+  \item token embedding：$0.02$ 截断正态；
+  \item Q/K/V projection：$0.02$ 截断正态；
+  \item attention output projection：$0.02$ 截断正态；
+  \item MLP 的三个线性矩阵：$0.02$ 截断正态；
+  \item LM head：$0.02$ 截断正态；
+  \item RMSNorm 与 QK norm：scale 为 $1$；
+  \item RoPE 与 sliding-window mask：无随机权重。
+\end{itemize}
+
+OLMo 3 7B 的 stage 2 midtraining 脚本从 stage 1 checkpoint 加载；stage 3 long-context 脚本从 stage 2 checkpoint 加载，并使用 YaRN RoPE scaling 把上下文扩展到 $65536$。这两个阶段都不是主体网络的随机重初始化。
+
+\subsection{OLMo 3 32B}
+
+OLMo 3 32B 的官方 stage 1 pretraining 脚本调用
+\[
+  \texttt{TransformerConfig.olmo3\_32B(...)}
+\]
+并且没有 \texttt{load\_path}，因此它从随机初始化开始。核心结构为
+\[
+  d_{\mathrm{model}}=5120,\quad L=64,\quad n_{\mathrm{heads}}=40,\quad n_{\mathrm{kv\ heads}}=8,\quad d_{\mathrm{ff}}=27648.
+\]
+虽然 32B 使用 GQA，因此 query heads 与 KV heads 数量不同，但 Q/K/V projection 在 \texttt{InitMethod.normal} 下仍然都使用相同的 $0.02$ 截断正态；初始化没有按 Q/K/V 输出维度或 fan-in 单独调整。
+
+OLMo 3 32B 的 stage 2 midtraining 和 stage 3 long-context 阶段从前一阶段 checkpoint 继续。官方 README 还说明 32B 在多个预训练后阶段使用 model souping，例如对两个 midtraining 输出或 long-context 最后三个 checkpoint 做参数平均。model souping 是 checkpoint 级别的参数合并，不是随机初始化策略。
+
+\section{为什么统一 $0.02$ 可以工作}
+
+OLMo 2/3 没有采用复杂的矩阵角色初始化，也没有在官方预训练脚本中启用深度缩放初始化。它能使用统一 $0.02$ 的原因不是这个常数本身有普适最优性，而是它与架构稳定化手段共同工作。
+
+\subsection{与 fan-in 尺度同量级}
+
+如果线性层输入维度为 $d$，fan-in 方差保持初始化常取
+\[
+  \std(W)=\frac{1}{\sqrt d}.
+\]
+对 OLMo 2/3 的常见宽度，
+\[
+  \frac{1}{\sqrt{4096}}=0.015625,\qquad
+  \frac{1}{\sqrt{5120}}\approx 0.01398.
+\]
+$0.02$ 比这些 fan-in 值略大，但仍处在同一数量级。它是 BERT/GPT/LLaMA-like 生态中成熟的工程默认值，而不是严格随宽度变化的理论公式。
+
+\subsection{Reordered Norm 与 QK Norm 降低尺度风险}
+
+OLMo 2/3 的一个重要特点是 \texttt{reordered\_norm}。普通 Pre-LN block 常写成
+\[
+  h=x+\mathrm{Attn}(\mathrm{Norm}(x)),
+\qquad
+  y=h+\mathrm{MLP}(\mathrm{Norm}(h)).
+\]
+而 reordered norm 把 norm 放到 attention/MLP 输出之后再写回 residual stream：
+\[
+  h=x+\mathrm{Norm}(\mathrm{Attn}(x)),
+\qquad
+  y=h+\mathrm{Norm}(\mathrm{MLP}(h)).
+\]
+这意味着残差分支写回前会经过归一化，初始化时分支输出尺度更可控。QK norm 又对 query/key 相关尺度提供额外约束，降低 attention logits 在训练早期过大或过尖的风险。在线性层统一使用 $0.02$ 时，这些结构稳定化手段非常关键。
+
+\subsection{无 bias 与 RoPE 减少额外随机源}
+
+OLMo 2/3 主要线性层关闭 bias，避免每层引入输入无关的固定偏移。RoPE 是确定性位置编码，没有可学习 position embedding 矩阵。因此随机初始化主要集中在线性层、embedding 和 LM head 上，配方更简单，也更容易复现。
+
+\section{容易混淆的点}
+
+\subsection{\texttt{normal} 不一定是不截断正态}
+
+旧 \texttt{OLMo} 配置写的是 \texttt{init\_fn=normal}，但同时设置 \texttt{init\_cutoff\_factor=3}。旧 trainer 的实现是在 cutoff 存在时调用截断正态。新 \texttt{OLMo-core} 的 \texttt{InitMethod.normal} 也明确是截断正态。因此在复现 OLMo 2/3 时，应该按截断正态实现，而不是直接用无限支撑的 \texttt{torch.nn.init.normal\_}。
+
+\subsection{不要把 stage 2 配置字段误读为重新初始化}
+
+stage 2、midtraining、long-context 脚本中仍会构造同样的模型配置，所以你仍能看到 \texttt{init\_std=0.02} 或默认 \texttt{InitMethod.normal}。但是这些脚本同时设置 \texttt{load\_path} 或 \texttt{load\_strategy=always}，实际训练开始前会加载 checkpoint。除非新增模块或参数名不匹配，否则主体参数来自 checkpoint。
+
+\subsection{OLMo-core 有深度缩放初始化，但官方 OLMo 2/3 没选}
+
+\texttt{OLMo-core} 的 \texttt{InitMethod.llama} 和 \texttt{InitMethod.llama\_depth} 会对部分输出层做层数或层号相关缩放；\texttt{InitMethod.fan\_in} 会使用 $1/\sqrt{d_{\mathrm{in}}}$。这些实现存在于代码库中，但官方 OLMo 2 32B 和 OLMo 3 7B/32B 预训练脚本没有启用它们。官方配方应以脚本调用的默认 \texttt{InitMethod.normal} 为准。
+
+\section{复现建议}
+
+如果要从零复现 OLMo 2/3 的 step 0 初始化，建议按以下规则实现：
+
+\begin{enumerate}
+  \item 使用官方结构配置：OLMo 2 7B/13B 用旧 \texttt{OLMo} 配置；OLMo 2 32B 和 OLMo 3 用 \texttt{OLMo-core} 的 \texttt{TransformerConfig.olmo2\_32B}、\texttt{olmo3\_7B}、\texttt{olmo3\_32B}。
+  \item 对所有 linear 和 embedding 权重使用
+  \[
+    \TruncNormal(0,0.02^2;[-0.06,0.06]).
+  \]
+  \item bias 若存在则置零；若配置关闭 bias，则不要创建 bias 参数。
+  \item RMSNorm/LayerNorm/QK norm 的 scale 初始化为 $1$，bias 关闭或置零。
+  \item 不要初始化 learned position embedding；OLMo 2/3 使用 RoPE。
+  \item stage 2、midtraining、long-context 不应重新随机初始化主体参数，而应加载前一阶段 checkpoint。
+  \item 若要逐 bit 或逐 checkpoint 复现，还要匹配初始化 seed、分布式 shard 初始化逻辑、dtype、FSDP/HSDP 构造顺序和 checkpoint 加载策略。
+\end{enumerate}
+
+\section{总结}
+
+OLMo 2 和 OLMo 3 的预训练初始化可以概括为一句话：\textbf{主体权重使用统一 $0.02$、$\pm3\sigma$ 截断正态初始化，训练稳定性主要由 RMSNorm/Reordered Norm、QK norm、RoPE、无 bias、warmup、梯度裁剪和优化器共同承担。}
+
+OLMo 2 7B/13B 在旧 trainer 中通过 \texttt{init\_fn=normal}、\texttt{init\_std=0.02}、\texttt{init\_cutoff\_factor=3} 实现；OLMo 2 32B 和 OLMo 3 在 \texttt{OLMo-core} 中通过默认 \texttt{InitMethod.normal}、\texttt{init\_std=0.02} 实现。OLMo 3 不是重新发明了一套初始化，而是在 OLMo 2 初始化默认值上加入新的数据配方、staged training、sliding-window attention 和 long-context RoPE scaling。
+
+\begin{thebibliography}{99}
+
+\bibitem{olmo2paper}
+Team OLMo.
+\newblock 2 OLMo 2 Furious.
+\newblock arXiv 2025.
+\newblock \url{https://arxiv.org/abs/2501.00656}
+
+\bibitem{olmo3paper}
+Team OLMo.
+\newblock Olmo 3.
+\newblock arXiv 2025.
+\newblock \url{https://arxiv.org/abs/2512.13961}
+
+\bibitem{olmo3report}
+Allen Institute for AI.
+\newblock Olmo 3 Technical Report.
+\newblock \url{https://www.datocms-assets.com/64837/1765558567-olmo_3_technical_report-4.pdf}
+
+\bibitem{olmo_old_config}
+Allen AI.
+\newblock OLMo old trainer model configuration, including \texttt{InitFnType} and \texttt{init\_std}.
+\newblock \url{https://github.com/allenai/OLMo/blob/main/olmo/config.py}
+
+\bibitem{olmo_old_init}
+Allen AI.
+\newblock OLMo old trainer initialization helper.
+\newblock \url{https://github.com/allenai/OLMo/blob/main/olmo/initialization.py}
+
+\bibitem{olmo_old_model}
+Allen AI.
+\newblock OLMo old trainer model reset logic.
+\newblock \url{https://github.com/allenai/OLMo/blob/main/olmo/model.py}
+
+\bibitem{olmo2_7b_stage1}
+Allen AI.
+\newblock OLMo 2 7B stage 1 official configuration.
+\newblock \url{https://github.com/allenai/OLMo/blob/main/configs/official-1124/OLMo2-7B-stage1.yaml}
+
+\bibitem{olmo2_13b_stage1}
+Allen AI.
+\newblock OLMo 2 13B stage 1 official configuration.
+\newblock \url{https://github.com/allenai/OLMo/blob/main/configs/official-1124/OLMo2-13B-stage1.yaml}
+
+\bibitem{olmo2_32b_readme}
+Allen AI.
+\newblock OLMo-core OLMo 2 official training scripts README.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo2/README.md}
+
+\bibitem{olmo2_32b_train}
+Allen AI.
+\newblock OLMo 2 32B official pretraining script.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo2/OLMo-2-0325-32B-train.py}
+
+\bibitem{olmo2_32b_anneal}
+Allen AI.
+\newblock OLMo 2 32B official annealing script.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo2/OLMo-2-0325-32B-anneal.py}
+
+\bibitem{olmocore_init}
+Allen AI.
+\newblock OLMo-core transformer initialization implementation.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/olmo_core/nn/transformer/init.py}
+
+\bibitem{olmocore_config}
+Allen AI.
+\newblock OLMo-core transformer configuration, including OLMo 2 and OLMo 3 config builders.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/olmo_core/nn/transformer/config.py}
+
+\bibitem{olmocore_attention}
+Allen AI.
+\newblock OLMo-core attention initialization implementation.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/olmo_core/nn/attention/__init__.py}
+
+\bibitem{olmocore_model}
+Allen AI.
+\newblock OLMo-core transformer model initialization flow.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/olmo_core/nn/transformer/model.py}
+
+\bibitem{olmocore_layernorm}
+Allen AI.
+\newblock OLMo-core LayerNorm and RMSNorm implementation.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/olmo_core/nn/layer_norm.py}
+
+\bibitem{olmo3_readme}
+Allen AI.
+\newblock OLMo-core OLMo 3 official training scripts README.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo3/README.md}
+
+\bibitem{olmo3_7b_pretrain1}
+Allen AI.
+\newblock OLMo 3 7B official pretraining script, part 1.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo3/OLMo-3-1025-7B-pretrain-1.py}
+
+\bibitem{olmo3_7b_pretrain2}
+Allen AI.
+\newblock OLMo 3 7B official pretraining script, part 2.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo3/OLMo-3-1025-7B-pretrain-2.py}
+
+\bibitem{olmo3_7b_midtrain}
+Allen AI.
+\newblock OLMo 3 7B official midtraining script.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo3/OLMo-3-1025-7B-midtrain.py}
+
+\bibitem{olmo3_7b_long}
+Allen AI.
+\newblock OLMo 3 7B official long-context script.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo3/OLMo-3-1025-7B-long-context.py}
+
+\bibitem{olmo3_32b_pretrain}
+Allen AI.
+\newblock OLMo 3 32B official pretraining script.
+\newblock \url{https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo3/OLMo-3-1025-32B-pretrain.py}
+
+\end{thebibliography}
+
+\end{document}
